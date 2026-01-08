@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Tracking 3D Particles</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        canvas { display: block; }
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-size: 1.2rem; transition: opacity 0.5s;
+        }
+        /* Hidden video element for processing */
+        #webcam { display: none; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading AI Models...</div>
+    <video id="webcam" autoplay playsinline></video>
+
+    <!-- Import Maps for Three.js and MediaPipe -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+        // --- Constants & State ---
+        const PARTICLE_COUNT = 5000;
+        const PARTICLE_SPREAD = 10;
+        let handLandmarker;
+        let webcamRunning = false;
+        const handPos = new THREE.Vector3(-100, -100, 0); // Start off-screen
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 5;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Create Particles ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const initialPositions = new Float32Array(PARTICLE_COUNT * 3);
+        const velocities = new Float32Array(PARTICLE_COUNT * 3);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i * 3;
+            // Set random positions
+            const x = (Math.random() - 0.5) * PARTICLE_SPREAD;
+            const y = (Math.random() - 0.5) * PARTICLE_SPREAD;
+            const z = (Math.random() - 0.5) * 2;
+
+            positions[i3] = initialPositions[i3] = x;
+            positions[i3 + 1] = initialPositions[i3 + 1] = y;
+            positions[i3 + 2] = initialPositions[i3 + 2] = z;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({
+            size: 0.04,
+            color: 0x00ffff,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // --- Initialize MediaPipe Hand Detection ---
+        async function initHandDetection() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            startWebcam();
+        }
+
+        async function startWebcam() {
+            const video = document.getElementById("webcam");
+            const constraints = { video: { width: 1280, height: 720 } };
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            video.srcObject = stream;
+            video.addEventListener("loadeddata", () => {
+                webcamRunning = true;
+                document.getElementById('loading').style.opacity = 0;
+                animate();
+            });
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            if (webcamRunning) {
+                const video = document.getElementById("webcam");
+                const results = handLandmarker.detectForVideo(video, performance.now());
+
+                if (results.landmarks && results.landmarks.length > 0) {
+                    // Landmark 8 is the Index Finger Tip
+                    const indexTip = results.landmarks[0][8];
+                    
+                    // Map normalized MediaPipe coords (0 to 1) to Three.js coords (-spread to +spread)
+                    // Note: x is inverted because webcams are usually mirrored
+                    handPos.x = (0.5 - indexTip.x) * PARTICLE_SPREAD; 
+                    handPos.y = (0.5 - indexTip.y) * (PARTICLE_SPREAD * 0.6);
+                } else {
+                    // Move "virtual hand" away if no real hand detected
+                    handPos.set(-100, -100, 0);
+                }
+            }
+
+            // Update Particles
+            const posAttr = geometry.attributes.position;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                
+                let x = posAttr.array[i3];
+                let y = posAttr.array[i3 + 1];
+                let z = posAttr.array[i3 + 2];
+
+                // 1. Return force (pull particles back to origin)
+                const dxOriginal = initialPositions[i3] - x;
+                const dyOriginal = initialPositions[i3 + 1] - y;
+                x += dxOriginal * 0.05;
+                y += dyOriginal * 0.05;
+
+                // 2. Repulsion force (push away from hand)
+                const dxHand = x - handPos.x;
+                const dyHand = y - handPos.y;
+                const distSq = dxHand * dxHand + dyHand * dyHand;
+                const influenceArea = 2.0;
+
+                if (distSq < influenceArea) {
+                    const force = (influenceArea - distSq) / influenceArea;
+                    x += dxHand * force * 0.5;
+                    y += dyHand * force * 0.5;
+                }
+
+                // 3. Floating animation
+                posAttr.array[i3] = x;
+                posAttr.array[i3 + 1] = y + Math.sin(time + i) * 0.002;
+                posAttr.array[i3 + 2] = z;
+            }
+
+            posAttr.needsUpdate = true;
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        initHandDetection();
+    </script>
+</body>
+</html>
