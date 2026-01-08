@@ -3,23 +3,43 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hand Tracking 3D Particles</title>
+    <title>AI Gesture Particle System</title>
     <style>
-        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
         canvas { display: block; }
+        
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: white;
+            background: rgba(0, 0, 0, 0.7); padding: 20px; border-radius: 10px;
+            pointer-events: none; border: 1px solid #444;
+        }
+        .gesture-status { color: #00ffcc; font-weight: bold; margin-top: 10px; }
+        #webcam { display: none; }
         #loading {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            color: white; font-size: 1.2rem; transition: opacity 0.5s;
+            color: white; text-align: center;
         }
-        /* Hidden video element for processing */
-        #webcam { display: none; }
     </style>
 </head>
 <body>
-    <div id="loading">Loading AI Models...</div>
+    <div id="loading">
+        <h2>Loading AI Models...</h2>
+        <p>Please allow camera access when prompted.</p>
+    </div>
+
+    <div id="ui">
+        <h3 style="margin-top:0">Hand Gestures</h3>
+        <ul style="padding-left: 20px; font-size: 14px;">
+            <li><b>Move Index:</b> Warp particles</li>
+            <li><b>Pinch (Thumb + Index):</b> Hold & move hand forward/back to <b>ZOOM</b></li>
+            <li><b>Open Palm:</b> Attract particles</li>
+            <li><b>Fist:</b> Repel particles</li>
+        </ul>
+        <div class="gesture-status" id="status">Detecting...</div>
+    </div>
+
     <video id="webcam" autoplay playsinline></video>
 
-    <!-- Import Maps for Three.js and MediaPipe -->
     <script type="importmap">
         {
             "imports": {
@@ -33,137 +53,176 @@
         import * as THREE from 'three';
         import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
-        // --- Constants & State ---
-        const PARTICLE_COUNT = 5000;
-        const PARTICLE_SPREAD = 10;
+        // --- Config ---
+        const PARTICLE_COUNT = 8000;
+        const SPREAD = 12;
         let handLandmarker;
         let webcamRunning = false;
-        const handPos = new THREE.Vector3(-100, -100, 0); // Start off-screen
+        let lastVideoTime = -1;
+
+        // Interaction State
+        const handData = {
+            x: 0, y: 0, z: 0,
+            isPinching: false,
+            isOpen: false,
+            pinchStartDistance: 0,
+            rawZ: 0
+        };
 
         // --- Three.js Setup ---
         const scene = new THREE.Scene();
         const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        camera.position.z = 5;
+        camera.position.z = 8;
 
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.setPixelRatio(window.devicePixelRatio);
         document.body.appendChild(renderer.domElement);
 
-        // --- Create Particles ---
+        // --- Particles Creation ---
         const geometry = new THREE.BufferGeometry();
         const positions = new Float32Array(PARTICLE_COUNT * 3);
-        const initialPositions = new Float32Array(PARTICLE_COUNT * 3);
-        const velocities = new Float32Array(PARTICLE_COUNT * 3);
+        const originalPos = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
 
         for (let i = 0; i < PARTICLE_COUNT; i++) {
             const i3 = i * 3;
-            // Set random positions
-            const x = (Math.random() - 0.5) * PARTICLE_SPREAD;
-            const y = (Math.random() - 0.5) * PARTICLE_SPREAD;
-            const z = (Math.random() - 0.5) * 2;
+            positions[i3] = originalPos[i3] = (Math.random() - 0.5) * SPREAD;
+            positions[i3+1] = originalPos[i3+1] = (Math.random() - 0.5) * SPREAD;
+            positions[i3+2] = originalPos[i3+2] = (Math.random() - 0.5) * 5;
 
-            positions[i3] = initialPositions[i3] = x;
-            positions[i3 + 1] = initialPositions[i3 + 1] = y;
-            positions[i3 + 2] = initialPositions[i3 + 2] = z;
+            colors[i3] = 0.2 + Math.random() * 0.3; // R
+            colors[i3+1] = 0.5 + Math.random() * 0.5; // G (Cyan-ish)
+            colors[i3+2] = 0.8 + Math.random() * 0.2; // B
         }
 
         geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
         const material = new THREE.PointsMaterial({
             size: 0.04,
-            color: 0x00ffff,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
             transparent: true,
-            opacity: 0.8,
-            blending: THREE.AdditiveBlending
+            opacity: 0.6
         });
 
         const points = new THREE.Points(geometry, material);
         scene.add(points);
 
-        // --- Initialize MediaPipe Hand Detection ---
-        async function initHandDetection() {
-            const vision = await FilesetResolver.forVisionTasks(
-                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
-            );
+        // --- AI Gesture Logic ---
+        async function setupAI() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
             handLandmarker = await HandLandmarker.createFromOptions(vision, {
                 baseOptions: {
                     modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
                     delegate: "GPU"
                 },
-                runningMode: "VIDEO",
-                numHands: 1
+                runningMode: "VIDEO", numHands: 1
             });
             startWebcam();
         }
 
         async function startWebcam() {
             const video = document.getElementById("webcam");
-            const constraints = { video: { width: 1280, height: 720 } };
-            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
             video.srcObject = stream;
             video.addEventListener("loadeddata", () => {
                 webcamRunning = true;
-                document.getElementById('loading').style.opacity = 0;
+                document.getElementById('loading').style.display = 'none';
                 animate();
             });
         }
 
-        // --- Animation Loop ---
-        const clock = new THREE.Clock();
+        function detectGestures(landmarks) {
+            const thumb = landmarks[4];
+            const index = landmarks[8];
+            const middle = landmarks[12];
+            const ring = landmarks[16];
+            const pinky = landmarks[20];
 
+            // 1. Detect Pinch (Thumb & Index distance)
+            const pinchDist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+            handData.isPinching = pinchDist < 0.04;
+
+            // 2. Detect Open Palm (Distance from wrist to tips)
+            const wrist = landmarks[0];
+            const avgDist = (
+                Math.hypot(index.x - wrist.x, index.y - wrist.y) +
+                Math.hypot(pinky.x - wrist.x, pinky.y - wrist.y)
+            ) / 2;
+            handData.isOpen = avgDist > 0.4;
+
+            // 3. Map Coordinates
+            handData.x = (0.5 - index.x) * SPREAD * 1.5;
+            handData.y = (0.5 - index.y) * SPREAD;
+            handData.rawZ = index.z; // Depth from camera
+
+            // Update UI
+            const statusBox = document.getElementById('status');
+            if (handData.isPinching) {
+                statusBox.innerText = "GESTURE: PINCH & ZOOM";
+                statusBox.style.color = "#ffcc00";
+            } else if (handData.isOpen) {
+                statusBox.innerText = "GESTURE: OPEN PALM (GRAVITY)";
+                statusBox.style.color = "#00ffcc";
+            } else {
+                statusBox.innerText = "GESTURE: FIST (REPEL)";
+                statusBox.style.color = "#ff5555";
+            }
+        }
+
+        // --- Main Animation Loop ---
         function animate() {
-            const delta = clock.getDelta();
-            const time = clock.getElapsedTime();
-
-            if (webcamRunning) {
-                const video = document.getElementById("webcam");
+            const video = document.getElementById("webcam");
+            if (video.currentTime !== lastVideoTime) {
                 const results = handLandmarker.detectForVideo(video, performance.now());
-
                 if (results.landmarks && results.landmarks.length > 0) {
-                    // Landmark 8 is the Index Finger Tip
-                    const indexTip = results.landmarks[0][8];
-                    
-                    // Map normalized MediaPipe coords (0 to 1) to Three.js coords (-spread to +spread)
-                    // Note: x is inverted because webcams are usually mirrored
-                    handPos.x = (0.5 - indexTip.x) * PARTICLE_SPREAD; 
-                    handPos.y = (0.5 - indexTip.y) * (PARTICLE_SPREAD * 0.6);
+                    detectGestures(results.landmarks[0]);
                 } else {
-                    // Move "virtual hand" away if no real hand detected
-                    handPos.set(-100, -100, 0);
+                    handData.x = -100; // Move interaction off-screen
                 }
+                lastVideoTime = video.currentTime;
             }
 
-            // Update Particles
+            // Handle Zoom via Pinch
+            if (handData.isPinching) {
+                // Move camera based on Hand Z (hand closer to camera = zoom in)
+                const targetZ = 3 + (handData.rawZ + 0.5) * 15;
+                camera.position.z += (targetZ - camera.position.z) * 0.1;
+            }
+
+            // Physics Update
             const posAttr = geometry.attributes.position;
+            const time = performance.now() * 0.001;
+
             for (let i = 0; i < PARTICLE_COUNT; i++) {
                 const i3 = i * 3;
-                
                 let x = posAttr.array[i3];
-                let y = posAttr.array[i3 + 1];
-                let z = posAttr.array[i3 + 2];
+                let y = posAttr.array[i3+1];
+                let z = posAttr.array[i3+2];
 
-                // 1. Return force (pull particles back to origin)
-                const dxOriginal = initialPositions[i3] - x;
-                const dyOriginal = initialPositions[i3 + 1] - y;
-                x += dxOriginal * 0.05;
-                y += dyOriginal * 0.05;
+                // Return to origin force
+                x += (originalPos[i3] - x) * 0.03;
+                y += (originalPos[i3+1] - y) * 0.03;
+                z += (originalPos[i3+2] - z) * 0.03;
 
-                // 2. Repulsion force (push away from hand)
-                const dxHand = x - handPos.x;
-                const dyHand = y - handPos.y;
-                const distSq = dxHand * dxHand + dyHand * dyHand;
-                const influenceArea = 2.0;
-
-                if (distSq < influenceArea) {
-                    const force = (influenceArea - distSq) / influenceArea;
-                    x += dxHand * force * 0.5;
-                    y += dyHand * force * 0.5;
+                // Hand Interaction
+                const dx = x - handData.x;
+                const dy = y - handData.y;
+                const distSq = dx*dx + dy*dy;
+                
+                if (distSq < 6) {
+                    const force = (6 - distSq) / 6;
+                    // If Palm is open: Pull in. If Fist: Push out.
+                    const pullShift = handData.isOpen ? -0.2 : 0.4;
+                    x += dx * force * pullShift;
+                    y += dy * force * pullShift;
                 }
 
-                // 3. Floating animation
                 posAttr.array[i3] = x;
-                posAttr.array[i3 + 1] = y + Math.sin(time + i) * 0.002;
-                posAttr.array[i3 + 2] = z;
+                posAttr.array[i3+1] = y;
+                posAttr.array[i3+2] = z;
             }
 
             posAttr.needsUpdate = true;
@@ -171,14 +230,13 @@
             requestAnimationFrame(animate);
         }
 
-        // Handle Resize
         window.addEventListener('resize', () => {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
         });
 
-        initHandDetection();
+        setupAI();
     </script>
 </body>
 </html>
