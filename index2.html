@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Perceptual Particle System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: white;
+            background: rgba(0, 0, 0, 0.8); padding: 20px; border-radius: 12px;
+            pointer-events: none; border: 1px solid #00f2ff;
+        }
+        .gesture-status { color: #00f2ff; font-weight: bold; margin-top: 10px; font-size: 1.1rem; }
+        #webcam { display: none; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; text-align: center; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <h2>Initializing AI Vision...</h2>
+        <p>Loading Face & Hand Models...</p>
+    </div>
+
+    <div id="ui">
+        <h3 style="margin:0 0 10px 0; color: #00f2ff;">Interactive Controls</h3>
+        <ul style="padding-left: 20px; font-size: 13px; line-height: 1.5;">
+            <li><b style="color: #ff4444;">FIST:</b> Repel + Zoom (Move hand forward/back)</li>
+            <li><b style="color: #44ff44;">PALM:</b> Attract (Gravity)</li>
+            <li><b style="color: #fbff00;">EYES:</b> Look around to tilt the galaxy</li>
+        </ul>
+        <div class="gesture-status" id="status">Scanning...</div>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+        // --- Config ---
+        const PARTICLE_COUNT = 10000;
+        const SPREAD = 18;
+        let handLandmarker, faceLandmarker;
+        let webcamRunning = false;
+        let lastVideoTime = -1;
+
+        const state = {
+            handX: 0, handY: 0, handSize: 0,
+            isFist: false, isOpen: false,
+            eyeX: 0, eyeY: 0 // Normalized eye/face center
+        };
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 8;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Particle Universe ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const basePos = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i * 3;
+            positions[i3] = basePos[i3] = (Math.random() - 0.5) * SPREAD;
+            positions[i3+1] = basePos[i3+1] = (Math.random() - 0.5) * SPREAD;
+            positions[i3+2] = basePos[i3+2] = (Math.random() - 0.5) * 10;
+
+            const mix = Math.random();
+            colors[i3] = mix * 0.2;            // R
+            colors[i3+1] = 0.5 + mix * 0.5;    // G
+            colors[i3+2] = 0.8 + mix * 0.2;    // B
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const material = new THREE.PointsMaterial({
+            size: 0.04, vertexColors: true,
+            blending: THREE.AdditiveBlending, transparent: true, opacity: 0.7
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // --- Dual AI Initialization ---
+        async function initAI() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+            
+            // 1. Load Hand Tracker
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+                runningMode: "VIDEO", numHands: 1
+            });
+
+            // 2. Load Face/Eye Tracker
+            faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`, delegate: "GPU" },
+                runningMode: "VIDEO", outputFaceBlendshapes: true
+            });
+
+            startCamera();
+        }
+
+        async function startCamera() {
+            const video = document.getElementById("webcam");
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+            video.srcObject = stream;
+            video.addEventListener("loadeddata", () => {
+                webcamRunning = true;
+                document.getElementById('loading').style.display = 'none';
+                animate();
+            });
+        }
+
+        function processVision(video) {
+            const now = performance.now();
+            
+            // Detect Hand
+            const handResults = handLandmarker.detectForVideo(video, now);
+            if (handResults.landmarks?.length > 0) {
+                const landmarks = handResults.landmarks[0];
+                const wrist = landmarks[0];
+                const tip = landmarks[9];
+                
+                state.handX = (0.5 - tip.x) * SPREAD * 1.5;
+                state.handY = (0.5 - tip.y) * SPREAD;
+                state.handSize = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+
+                // Fist Logic
+                const fingerTipsDist = Math.hypot(landmarks[8].x - wrist.x, landmarks[8].y - wrist.y);
+                state.isFist = fingerTipsDist < state.handSize * 1.5;
+                state.isOpen = fingerTipsDist > state.handSize * 2.5;
+            } else {
+                state.handX = -100;
+            }
+
+            // Detect Eyes/Face
+            const faceResults = faceLandmarker.detectForVideo(video, now);
+            if (faceResults.faceLandmarks?.length > 0) {
+                // Landmark 1 is the tip of the nose, used as a stable face-center anchor
+                const nose = faceResults.faceLandmarks[0][1];
+                state.eyeX = (nose.x - 0.5) * 2; // -1 to 1
+                state.eyeY = (nose.y - 0.5) * 2; // -1 to 1
+            }
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            const video = document.getElementById("webcam");
+            if (video.currentTime !== lastVideoTime) {
+                processVision(video);
+                lastVideoTime = video.currentTime;
+            }
+
+            // 1. Eye Reaction: Tilt the entire particle system
+            // This creates a parallax effect based on where you are looking/leaning
+            points.rotation.y += (state.eyeX * 0.3 - points.rotation.y) * 0.05;
+            points.rotation.x += (state.eyeY * 0.3 - points.rotation.x) * 0.05;
+
+            // 2. Hand Zoom (Only on Fist)
+            if (state.isFist) {
+                const targetZ = THREE.MathUtils.mapLinear(state.handSize, 0.05, 0.25, 12, 2);
+                camera.position.z += (targetZ - camera.position.z) * 0.1;
+                document.getElementById('status').innerText = "MODE: FIST (ZOOM)";
+            } else if (state.isOpen) {
+                document.getElementById('status').innerText = "MODE: PALM (ATTRACT)";
+            } else {
+                document.getElementById('status').innerText = "MODE: NEUTRAL";
+            }
+
+            // 3. Particle Physics
+            const posAttr = geometry.attributes.position;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                let x = posAttr.array[i3];
+                let y = posAttr.array[i3+1];
+                let z = posAttr.array[i3+2];
+
+                // Smooth return to base
+                x += (basePos[i3] - x) * 0.02;
+                y += (basePos[i3+1] - y) * 0.02;
+                z += (basePos[i3+2] - z) * 0.02;
+
+                // Hand Force
+                const dx = x - state.handX;
+                const dy = y - state.handY;
+                const distSq = dx*dx + dy*dy;
+
+                if (distSq < 10) {
+                    const force = (10 - distSq) / 10;
+                    let strength = state.isFist ? 0.7 : (state.isOpen ? -0.4 : 0.1);
+                    x += dx * force * strength;
+                    y += dy * force * strength;
+                }
+
+                posAttr.array[i3] = x;
+                posAttr.array[i3+1] = y;
+                posAttr.array[i3+2] = z;
+            }
+
+            posAttr.needsUpdate = true;
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        initAI();
+    </script>
+</body>
+</html>
