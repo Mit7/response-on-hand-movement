@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Magic: The Singularity</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: #00f2ff;
+            background: rgba(0, 0, 0, 0.85); padding: 20px; border-radius: 8px;
+            pointer-events: none; border: 2px solid #00f2ff;
+            box-shadow: 0 0 20px rgba(0, 242, 255, 0.3);
+        }
+        .mode-active { color: #fff; text-shadow: 0 0 10px #fff; font-size: 1.2rem; }
+        #webcam { display: none; }
+        #loading { position: absolute; width: 100%; top: 50%; text-align: center; color: white; }
+    </style>
+</head>
+<body>
+    <div id="loading"><h1>SUMMONING PARTICLES...</h1></div>
+    <div id="ui">
+        <h2 style="margin:0 0 10px 0;">GALAXY COMMAND</h2>
+        <div id="status" class="mode-active">Initializing...</div>
+        <p style="font-size: 0.8rem; color: #aaa;">
+            1. ONE HAND: Move & Distort<br>
+            2. TWO HANDS: Bring palms together to <b>CHARGE SINGULARITY</b><br>
+            3. TOUCH HANDS: <b>THE BIG BANG</b><br>
+            4. EYES: Look around to tilt space
+        </p>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+        // --- Setup Variables ---
+        const PARTICLE_COUNT = 15000;
+        const SPREAD = 20;
+        let handLandmarker, faceLandmarker;
+        let webcamRunning = false;
+        
+        const worldState = {
+            hands: [], // Array of {x, y, z, isFist}
+            eyeX: 0, eyeY: 0,
+            singularity: { active: false, x: 0, y: 0, power: 0 },
+            explosionTime: 0
+        };
+
+        // --- Three.js Scene ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 10;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false }); // Fast
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Particles ---
+        const geo = new THREE.BufferGeometry();
+        const pos = new Float32Array(PARTICLE_COUNT * 3);
+        const basePos = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i * 3;
+            pos[i3] = basePos[i3] = (Math.random() - 0.5) * SPREAD;
+            pos[i3+1] = basePos[i3+1] = (Math.random() - 0.5) * SPREAD;
+            pos[i3+2] = basePos[i3+2] = (Math.random() - 0.5) * 10;
+
+            colors[i3] = 0.1; 
+            colors[i3+1] = 0.6; 
+            colors[i3+2] = 1.0;
+            sizes[i] = Math.random() * 2;
+        }
+
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const mat = new THREE.PointsMaterial({
+            size: 0.05, vertexColors: true, blending: THREE.AdditiveBlending,
+            transparent: true, opacity: 0.8
+        });
+
+        const points = new THREE.Points(geo, mat);
+        scene.add(points);
+
+        // --- AI Engine ---
+        async function initAI() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+                runningMode: "VIDEO", numHands: 2
+            });
+            faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`, delegate: "GPU" },
+                runningMode: "VIDEO"
+            });
+            startCamera();
+        }
+
+        async function startCamera() {
+            const video = document.getElementById("webcam");
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+            video.srcObject = stream;
+            video.onloadeddata = () => { 
+                webcamRunning = true; 
+                document.getElementById('loading').style.display='none';
+                animate(); 
+            };
+        }
+
+        function updateAI() {
+            const video = document.getElementById("webcam");
+            const now = performance.now();
+            
+            // 1. Face Tracking
+            const face = faceLandmarker.detectForVideo(video, now);
+            if (face.faceLandmarks?.length > 0) {
+                const nose = face.faceLandmarks[0][1];
+                worldState.eyeX = (nose.x - 0.5) * 2;
+                worldState.eyeY = (nose.y - 0.5) * 2;
+            }
+
+            // 2. Hand Tracking
+            const hands = handLandmarker.detectForVideo(video, now);
+            worldState.hands = [];
+            if (hands.landmarks) {
+                hands.landmarks.forEach(lm => {
+                    worldState.hands.push({
+                        x: (0.5 - lm[9].x) * SPREAD * 1.5,
+                        y: (0.5 - lm[9].y) * SPREAD,
+                        z: lm[9].z
+                    });
+                });
+            }
+
+            // 3. Singularity Gesture Logic
+            if (worldState.hands.length === 2) {
+                const h1 = worldState.hands[0];
+                const h2 = worldState.hands[1];
+                const dist = Math.hypot(h1.x - h2.x, h1.y - h2.y);
+                
+                if (dist < 4) {
+                    worldState.singularity.active = true;
+                    worldState.singularity.x = (h1.x + h2.x) / 2;
+                    worldState.singularity.y = (h1.y + h2.y) / 2;
+                    worldState.singularity.power = THREE.MathUtils.lerp(worldState.singularity.power, 1.0, 0.1);
+                    document.getElementById('status').innerText = "CHARGING SINGULARITY...";
+                    
+                    // Explosion Trigger
+                    if (dist < 0.8 && worldState.explosionTime <= 0) {
+                        worldState.explosionTime = 1.0; // Trigger burst
+                    }
+                } else {
+                    worldState.singularity.active = false;
+                    worldState.singularity.power *= 0.8;
+                }
+            } else {
+                worldState.singularity.active = false;
+                worldState.singularity.power *= 0.8;
+                document.getElementById('status').innerText = worldState.hands.length ? "MANIPULATING..." : "WAITING FOR HANDS...";
+            }
+        }
+
+        function animate() {
+            if (webcamRunning) updateAI();
+
+            const time = performance.now() * 0.001;
+            const positions = geo.attributes.position.array;
+            const colorsAttr = geo.attributes.color.array;
+
+            // Tilt scene based on eyes
+            points.rotation.y += (worldState.eyeX * 0.4 - points.rotation.y) * 0.05;
+            points.rotation.x += (worldState.eyeY * 0.4 - points.rotation.x) * 0.05;
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                
+                // Physics: Return to base
+                positions[i3] += (basePos[i3] - positions[i3]) * 0.02;
+                positions[i3+1] += (basePos[i3+1] - positions[i3+1]) * 0.02;
+                positions[i3+2] += (basePos[i3+2] - positions[i3+2]) * 0.02;
+
+                // Singularity Attraction
+                if (worldState.singularity.power > 0.1) {
+                    const dx = worldState.singularity.x - positions[i3];
+                    const dy = worldState.singularity.y - positions[i3+1];
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    const force = worldState.singularity.power * 0.5;
+                    positions[i3] += dx * force;
+                    positions[i3+1] += dy * force;
+                    
+                    // Singularity Glow (turn gold)
+                    colorsAttr[i3] = 1.0;
+                    colorsAttr[i3+1] = 0.8;
+                } else {
+                    // Back to blue
+                    colorsAttr[i3] += (0.1 - colorsAttr[i3]) * 0.05;
+                    colorsAttr[i3+1] += (0.6 - colorsAttr[i3+1]) * 0.05;
+                }
+
+                // Explosion Shockwave
+                if (worldState.explosionTime > 0) {
+                    const dx = positions[i3] - worldState.singularity.x;
+                    const dy = positions[i3+1] - worldState.singularity.y;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist < 10) {
+                        positions[i3] += (dx / dist) * 5 * worldState.explosionTime;
+                        positions[i3+1] += (dy / dist) * 5 * worldState.explosionTime;
+                        // Rainbow colors
+                        colorsAttr[i3] = Math.random();
+                        colorsAttr[i3+1] = Math.random();
+                        colorsAttr[i3+2] = Math.random();
+                    }
+                }
+
+                // Individual Hand Repel
+                worldState.hands.forEach(h => {
+                    const dx = positions[i3] - h.x;
+                    const dy = positions[i3+1] - h.y;
+                    const dSq = dx*dx + dy*dy;
+                    if (dSq < 4) {
+                        positions[i3] += dx * 0.1;
+                        positions[i3+1] += dy * 0.1;
+                    }
+                });
+            }
+
+            if (worldState.explosionTime > 0) {
+                worldState.explosionTime -= 0.05;
+                document.getElementById('status').innerText = "BIG BANG!!";
+            }
+
+            geo.attributes.position.needsUpdate = true;
+            geo.attributes.color.needsUpdate = true;
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        initAI();
+    </script>
+</body>
+</html>
